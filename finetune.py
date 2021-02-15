@@ -24,6 +24,7 @@ from transformers import (
 from transformers.data.processors.squad import SquadResult, SquadV1Processor
 
 from metrics import compute_predictions, qa_evaluate
+from utils import dict_to_str, get_logger
 
 logger = logging.getLogger(__name__)
 wandb_logging = False
@@ -39,6 +40,12 @@ def set_seed(seed):
 
 def to_list(tensor):
     return tensor.detach().cpu().tolist()
+
+
+def log_metrics(metrics_dict):
+    if wandb_logging:
+        wandb.log(metrics_dict)
+    logger.info(dict_to_str(metrics_dict))
 
 
 def parse_args():
@@ -135,33 +142,14 @@ def logging_setup(args):
             os.environ["WANDB_JOB_TYPE"] = args.job_type
         wandb.login()
         wandb.init(project=args.project_name, config=wandb_config(args))
-    logger.setLevel(logging.INFO)
-    fmt = "%(asctime)s - %(levelname)s - %(name)s -   %(message)s"
-    datefmt = "%m/%d/%Y %H:%M:%S"
-    logging.basicConfig(format=fmt, datefmt=datefmt, level=logging.INFO)
-    file_handler = logging.FileHandler(os.path.join(args.output_dir, args.exp_name + "_log.txt"))
-    file_handler.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
-    logger.addHandler(file_handler)
-
-
-def log(msg, step=None, to_str=False):
-    if isinstance(msg, str):
-        logger.info(msg)
-    elif isinstance(msg, dict):
-        if wandb_logging:
-            if step:
-                wandb.log(msg, step=step)
-            else:
-                wandb.log(msg)
-        if to_str:
-            msg_str = ", ".join([f"{k}: {v}" for k, v in msg.items() if k != "custom_step"])
-            logger.info(msg_str)
+    global logger
+    logger = get_logger(logger, os.path.join(args.output_dir, args.exp_name + "_log.txt"))
 
 
 def load_and_cache_examples(args, tokenizer, evaluate=False):
-    cached_path = os.path.join(args.output_dir, "cached_{}".format("eval" if evaluate else "train"))
+    cached_path = os.path.join(args.output_dir, f"cached_{'eval' if evaluate else 'train'}")
     if os.path.exists(cached_path):
-        log("Loading cached file {} ...".format(cached_path))
+        logger.debug(f"Loading cached file {cached_path} ...")
         loaded = torch.load(cached_path)
         features, dataset, examples = (
             loaded["features"],
@@ -172,7 +160,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False):
         if (evaluate and not args.evaluation_set) or (not evaluate and not args.training_set):
             raise ValueError("The path to the dataset file is not given.")
         filepath = args.training_set if evaluate else args.evaluation_set
-        log("Processing dataset file {} ...".format(filepath))
+        logger.debug(f"Processing dataset file {filepath} ...")
         processor = SquadV1Processor()
         if evaluate:
             examples = processor.get_dev_examples(".", filename=filepath)
@@ -188,7 +176,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False):
             return_dataset="pt",
             threads=args.threads,
         )
-        log("Saving cached file {} ...".format(cached_path))
+        logger.debug(f"Saving cached file {cached_path} ...")
         torch.save({"features": features, "dataset": dataset, "examples": examples}, cached_path)
 
     if evaluate:
@@ -198,9 +186,11 @@ def load_and_cache_examples(args, tokenizer, evaluate=False):
 
 def train(args, dataset, model, tokenizer):
     dataloader = DataLoader(dataset, sampler=RandomSampler(dataset), batch_size=args.train_batch_size)
-    log("Training: num of examples = {}, num of steps per epoch = {}, total steps = {}".format(
-        len(dataset), len(dataloader), len(dataloader) * args.epochs
-    ))
+    log_metrics({
+        "train/examples": len(dataset),
+        "train/steps_per_epoch": len(dataloader),
+        "train/total_steps": len(dataloader) * args.epochs
+    })
     if wandb_logging:
         wandb.watch(model)
 
@@ -225,7 +215,7 @@ def train(args, dataset, model, tokenizer):
     training_loss = 0.0
     logging_loss = 0.0
     for i in range(args.epochs):
-        log("Training epoch {}".format(i + 1))
+        logger.debug(f"Training epoch {i + 1}")
 
         model.train()
         for batch in tqdm(dataloader, desc="Training"):
@@ -245,11 +235,11 @@ def train(args, dataset, model, tokenizer):
             scheduler.step()
             model.zero_grad()
             global_step += 1
-            if global_step % args.logging_steps == 0:
-                log(
+            if wandb_logging and global_step % args.logging_steps == 0:
+                wandb.log(
                     {
-                        "lr": scheduler.get_last_lr()[0],
-                        "loss": (training_loss - logging_loss) / args.logging_steps,
+                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/loss": (training_loss - logging_loss) / args.logging_steps,
                     },
                     step=global_step,
                 )
@@ -257,20 +247,19 @@ def train(args, dataset, model, tokenizer):
 
         if args.evaluation_set:
             results = evaluate(args, model, tokenizer)
-            log({
-                "EM": results["EM"],
-                "F1": results["F1"],
-                "Precision": results["precision"],
-                "Recall": results["recall"],
-                "Skip": results["Skip_count"],
-                "Total": results["Total"]
-            }, global_step, to_str=True)
+            log_metrics({
+                "epoch": i + 1,
+                "eval/EM": results["EM"],
+                "eval/F1": results["F1"],
+                "eval/Precision": results["Precision"],
+                "eval/Recall": results["Recall"],
+            })
 
         if args.checkpoint:
-            ckpt_dir = os.path.join(args.output_dir, "checkpoint_epoch_{}".format(i + 1))
+            ckpt_dir = os.path.join(args.output_dir, f"checkpoint_epoch_{i + 1}")
             if not os.path.exists(ckpt_dir):
                 os.makedirs(ckpt_dir)
-            log("Saving checkpoint to {}".format(ckpt_dir))
+            logger.debug(f"Saving checkpoint to {ckpt_dir}")
             model.save_pretrained(ckpt_dir)
             torch.save(args, os.path.join(ckpt_dir, "training_args.bin"))
 
@@ -278,7 +267,10 @@ def train(args, dataset, model, tokenizer):
 def evaluate(args, model, tokenizer, output=False):
     dataset, examples, features = load_and_cache_examples(args, tokenizer, evaluate=True)
     dataloader = DataLoader(dataset, sampler=SequentialSampler(dataset), batch_size=args.eval_batch_size)
-    log("Evaluating: num of examples = {}, num of steps = {}".format(len(dataset), len(dataloader)))
+    log_metrics({
+        "eval/examples": len(dataset),
+        "eval/steps": len(dataloader),
+    })
 
     all_results = []
     for batch in tqdm(dataloader, desc="Evaluating"):
@@ -338,21 +330,19 @@ def main():
     if args.training_set:
         train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False)
         train(args, train_dataset, model, tokenizer)
-        log("Saving model to {}".format(args.output_dir))
+        logger.debug(f"Saving model to {args.output_dir}")
         model.save_pretrained(args.output_dir)
         torch.save(args, os.path.join(args.output_dir, "training_args.bin"))
 
     # Evaluation
     if args.evaluation_set:
         results = evaluate(args, model, tokenizer, output=True)
-        log("Result: EM {}, F1 {}, Precision {}, Recall {}, Skip {}, Total".format(
-            results["EM"],
-            results["F1"],
-            results["precision"],
-            results["recall"],
-            results["Skip_count"],
-            results["Total"],
-        ))
+        log_metrics({
+            "eval/EM": results["EM"],
+            "eval/F1": results["F1"],
+            "eval/Precision": results["Precision"],
+            "eval/Recall": results["Recall"],
+        })
 
 
 if __name__ == "__main__":

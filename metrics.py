@@ -383,8 +383,8 @@ def qa_evaluate(examples, predictions, lang="en"):
     return {
         "EM": 100.0 * em / total,
         "F1": 100.0 * f1 / total,
-        "precision": 100.0 * precision / total,
-        "recall": 100.0 * recall / total,
+        "Precision": 100.0 * precision / total,
+        "Recall": 100.0 * recall / total,
         "Skip_count":  skip,
         "Total": total,
     }
