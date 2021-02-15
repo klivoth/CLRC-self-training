@@ -159,7 +159,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False):
     else:
         if (evaluate and not args.evaluation_set) or (not evaluate and not args.training_set):
             raise ValueError("The path to the dataset file is not given.")
-        filepath = args.training_set if evaluate else args.evaluation_set
+        filepath = args.evaluation_set if evaluate else args.training_set
         logger.debug(f"Processing dataset file {filepath} ...")
         processor = SquadV1Processor()
         if evaluate:
