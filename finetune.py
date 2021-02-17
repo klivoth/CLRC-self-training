@@ -303,13 +303,14 @@ def main():
             "eval/steps": len(dataloader),
         })
 
-        results = evaluate(args, model, tokenizer, dataloader, examples, features, output=True)
-        log_metrics({
-            "eval/EM": results["EM"],
-            "eval/F1": results["F1"],
-            "eval/Precision": results["Precision"],
-            "eval/Recall": results["Recall"],
-        })
+        if not args.training_set:
+            results = evaluate(args, model, tokenizer, dataloader, examples, features, output=True)
+            log_metrics({
+                "eval/EM": results["EM"],
+                "eval/F1": results["F1"],
+                "eval/Precision": results["Precision"],
+                "eval/Recall": results["Recall"],
+            })
     remove_cache(args.output_dir)
 
 
