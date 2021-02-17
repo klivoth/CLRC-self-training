@@ -430,6 +430,7 @@ def main():
     log_metrics({"eval/examples": len(eval_examples)})
 
     # self-training
+    evaluate(args, tokenizer, model, eval_dataloader, eval_examples, eval_features, 0)
     for i in range(args.iterations):
         logger.debug(f"Self-training iteration {i + 1}")
 
