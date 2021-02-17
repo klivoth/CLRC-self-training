@@ -19,12 +19,11 @@ from transformers import (
     BertForQuestionAnswering,
     AdamW,
     get_linear_schedule_with_warmup,
-    squad_convert_examples_to_features,
 )
-from transformers.data.processors.squad import SquadResult, SquadV1Processor
+from transformers.data.processors.squad import SquadResult
 
 from metrics import compute_predictions, qa_evaluate
-from utils import dict_to_str, get_logger
+from utils import dict_to_str, get_logger, load_and_cache_examples, remove_cache
 
 logger = logging.getLogger(__name__)
 wandb_logging = False
@@ -146,54 +145,7 @@ def logging_setup(args):
     logger = get_logger(logger, os.path.join(args.output_dir, args.exp_name + "_log.txt"))
 
 
-def load_and_cache_examples(args, tokenizer, evaluate=False):
-    cached_path = os.path.join(args.output_dir, f"cached_{'eval' if evaluate else 'train'}")
-    if os.path.exists(cached_path):
-        logger.debug(f"Loading cached file {cached_path} ...")
-        loaded = torch.load(cached_path)
-        features, dataset, examples = (
-            loaded["features"],
-            loaded["dataset"],
-            loaded["examples"],
-        )
-    else:
-        if (evaluate and not args.evaluation_set) or (not evaluate and not args.training_set):
-            raise ValueError("The path to the dataset file is not given.")
-        filepath = args.evaluation_set if evaluate else args.training_set
-        logger.debug(f"Processing dataset file {filepath} ...")
-        processor = SquadV1Processor()
-        if evaluate:
-            examples = processor.get_dev_examples(".", filename=filepath)
-        else:
-            examples = processor.get_train_examples(".", filename=filepath)
-        features, dataset = squad_convert_examples_to_features(
-            examples=examples,
-            tokenizer=tokenizer,
-            max_seq_length=args.max_seq_length,
-            doc_stride=args.doc_stride,
-            max_query_length=args.max_query_length,
-            is_training=not evaluate,
-            return_dataset="pt",
-            threads=args.threads,
-        )
-        logger.debug(f"Saving cached file {cached_path} ...")
-        torch.save({"features": features, "dataset": dataset, "examples": examples}, cached_path)
-
-    if evaluate:
-        return dataset, examples, features
-    return dataset
-
-
-def train(args, dataset, model, tokenizer):
-    dataloader = DataLoader(dataset, sampler=RandomSampler(dataset), batch_size=args.train_batch_size)
-    log_metrics({
-        "train/examples": len(dataset),
-        "train/steps_per_epoch": len(dataloader),
-        "train/total_steps": len(dataloader) * args.epochs
-    })
-    if wandb_logging:
-        wandb.watch(model)
-
+def train(args, model, tokenizer, dataloader):
     # Prepare optimizer and scheduler
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
@@ -246,7 +198,7 @@ def train(args, dataset, model, tokenizer):
                 logging_loss = training_loss
 
         if args.evaluation_set:
-            results = evaluate(args, model, tokenizer)
+            results = epoch_end_eval(args, model, tokenizer)
             log_metrics({
                 "epoch": i + 1,
                 "eval/EM": results["EM"],
@@ -264,14 +216,13 @@ def train(args, dataset, model, tokenizer):
             torch.save(args, os.path.join(ckpt_dir, "training_args.bin"))
 
 
-def evaluate(args, model, tokenizer, output=False):
-    dataset, examples, features = load_and_cache_examples(args, tokenizer, evaluate=True)
+def epoch_end_eval(args, model, tokenizer):
+    dataset, examples, features = load_and_cache_examples(args, tokenizer, "eval")
     dataloader = DataLoader(dataset, sampler=SequentialSampler(dataset), batch_size=args.eval_batch_size)
-    log_metrics({
-        "eval/examples": len(dataset),
-        "eval/steps": len(dataloader),
-    })
+    return evaluate(args, model, tokenizer, dataloader, examples, features)
 
+
+def evaluate(args, model, tokenizer, dataloader, examples, features, output=False):
     all_results = []
     for batch in tqdm(dataloader, desc="Evaluating"):
         model.eval()
@@ -328,21 +279,38 @@ def main():
 
     # Training loop (including evaluation after every epoch if evaluation_set provided)
     if args.training_set:
-        train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False)
-        train(args, train_dataset, model, tokenizer)
+        dataset, examples, _ = load_and_cache_examples(args, tokenizer, "train")
+        dataloader = DataLoader(dataset, sampler=RandomSampler(dataset), batch_size=args.train_batch_size)
+        log_metrics({
+            "train/examples": len(examples),
+            "train/steps_per_epoch": len(dataloader),
+            "train/total_steps": len(dataloader) * args.epochs
+        })
+        if wandb_logging:
+            wandb.watch(model)
+
+        train(args, model, tokenizer, dataloader)
         logger.debug(f"Saving model to {args.output_dir}")
         model.save_pretrained(args.output_dir)
         torch.save(args, os.path.join(args.output_dir, "training_args.bin"))
 
     # Evaluation
     if args.evaluation_set:
-        results = evaluate(args, model, tokenizer, output=True)
+        dataset, examples, features = load_and_cache_examples(args, tokenizer, "eval")
+        dataloader = DataLoader(dataset, sampler=SequentialSampler(dataset), batch_size=args.eval_batch_size)
+        log_metrics({
+            "eval/examples": len(dataset),
+            "eval/steps": len(dataloader),
+        })
+
+        results = evaluate(args, model, tokenizer, dataloader, examples, features, output=True)
         log_metrics({
             "eval/EM": results["EM"],
             "eval/F1": results["F1"],
             "eval/Precision": results["Precision"],
             "eval/Recall": results["Recall"],
         })
+    remove_cache(args.output_dir)
 
 
 if __name__ == "__main__":

@@ -21,12 +21,11 @@ from transformers import (
     BertForQuestionAnswering,
     AdamW,
     get_linear_schedule_with_warmup,
-    squad_convert_examples_to_features,
 )
-from transformers.data.processors.squad import SquadResult, SquadV1Processor
+from transformers.data.processors.squad import SquadResult
 
 from metrics import compute_predictions, qa_evaluate
-from utils import dict_to_str, get_logger
+from utils import dict_to_str, get_logger, load_and_cache_examples, remove_cache
 
 logger = logging.getLogger(__name__)
 wandb_logging = False
@@ -67,7 +66,9 @@ def parse_args():
     parser.add_argument(
         "--prob_threshold", default=None, type=float, required=True, help="Probability threshold for pseudo-labels."
     )
-    parser.add_argument("--noise", default=0.0, type=float, help="Level of noise added during predicting pseudo-labels.")
+    parser.add_argument(
+        "--noise", default=0.0, type=float, help="Level of noise added during predicting pseudo-labels."
+    )
     parser.add_argument(
         "--no_relabel", action="store_true", help="Not to update existing pseudo-labels every iteration."
     )
@@ -157,43 +158,6 @@ def logging_setup(args):
     logger = get_logger(logger, os.path.join(args.output_dir, args.exp_name + "_log.txt"))
 
 
-def load_and_cache_examples(args, tokenizer, filepath, mode):
-    if mode != "train":
-        cached_file = os.path.join(args.output_dir, f"cached_{mode}")
-        if os.path.exists(cached_file):
-            logger.debug(f"Loading cached file {cached_file} ...")
-            loaded = torch.load(cached_file)
-            features, dataset, examples = (
-                loaded["features"],
-                loaded["dataset"],
-                loaded["examples"],
-            )
-            return dataset, examples, features
-
-    logger.debug(f"Processing dataset file {filepath} ...")
-    processor = SquadV1Processor()
-    if mode != "train":
-        examples = processor.get_dev_examples(".", filename=filepath)
-    else:
-        examples = processor.get_train_examples(".", filename=filepath)
-    features, dataset = squad_convert_examples_to_features(
-        examples=examples,
-        tokenizer=tokenizer,
-        max_seq_length=args.max_seq_length,
-        doc_stride=args.doc_stride,
-        max_query_length=args.max_query_length,
-        is_training=(mode == "train"),
-        return_dataset="pt",
-        threads=args.threads,
-    )
-
-    if mode != "train":
-        logger.debug(f"Saving cached file {cached_file} ...")
-        torch.save({"features": features, "dataset": dataset, "examples": examples}, cached_file)
-
-    return dataset, examples, features
-
-
 def predict(args, dataloader, features, model, noise=0.0):
     all_results = []
     model.eval()
@@ -230,7 +194,7 @@ def get_answer_start(example, pred, lang="en"):
         occurrences = [m.start() for m in re.finditer(re.escape(pred["text"]), example.context_text)]
         if not occurrences:
             return None
-        closest = min(occurrences, key=lambda x:abs(x - pred["start_tok_index"]))
+        closest = min(occurrences, key=lambda x: abs(x - pred["start_tok_index"]))
         return {"text": pred["text"], "answer_start": closest}
 
     # word
@@ -314,19 +278,7 @@ def output_pseudo_labels(unlabeled_set, pseudo_labels, output):
     return acc_exact / total, acc_text / total
 
 
-def label(args, tokenizer, model, labeled_set_path, iteration, prev_labeled_set_path):
-    dataset, examples, features = load_and_cache_examples(
-        args,
-        tokenizer,
-        args.unlabeled_set,
-        mode="label",
-    )
-    dataloader = DataLoader(dataset, sampler=SequentialSampler(dataset), batch_size=args.eval_batch_size)
-    log_metrics({
-        "iteration": iteration,
-        "label/unlabeled_examples": len(examples),
-    })
-
+def label(args, tokenizer, model, dataloader, examples, features, iteration, labeled_set_path, prev_labeled_set_path):
     results = predict(args, dataloader, features, model, args.noise)
     predictions = compute_predictions(
         tokenizer,
@@ -360,19 +312,7 @@ def label(args, tokenizer, model, labeled_set_path, iteration, prev_labeled_set_
     return output_pseudo_labels(args.unlabeled_set, pseudo_labels, labeled_set_path)
 
 
-def train(args, tokenizer, model, labeled_set, iteration, global_step):
-    dataset, examples, features = load_and_cache_examples(
-        args,
-        tokenizer,
-        labeled_set,
-        mode="train",
-    )
-    dataloader = DataLoader(dataset, sampler=RandomSampler(dataset), batch_size=args.train_batch_size)
-    log_metrics({
-        "iteration": iteration,
-        "train/examples": len(examples),
-    })
-
+def train(args, tokenizer, model, dataloader, global_step):
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
         {
@@ -432,18 +372,7 @@ def train(args, tokenizer, model, labeled_set, iteration, global_step):
     return global_step
 
 
-def evaluate(args, tokenizer, model, iteration):
-    dataset, examples, features = load_and_cache_examples(
-        args,
-        tokenizer,
-        args.evaluation_set,
-        mode="eval",
-    )
-    dataloader = DataLoader(dataset, sampler=SequentialSampler(dataset), batch_size=args.eval_batch_size)
-    log_metrics({
-        "iteration": iteration,
-        "eval/examples": len(examples),
-    })
+def evaluate(args, tokenizer, model, dataloader, examples, features, iteration):
     output_prediction_file = os.path.join(args.output_dir, "prediction_iter_{}.json".format(iteration))
     output_nbest_file = os.path.join(args.output_dir, "nbest_prediction_iter_{}.json".format(iteration))
 
@@ -480,6 +409,26 @@ def main():
     model = BertForQuestionAnswering.from_pretrained(args.start_model).to(args.device)
     global_step = 0
 
+    # load unlabeled and eval data
+    unlabeled_dataset, unlabeled_examples, unlabeled_features = load_and_cache_examples(
+        args,
+        tokenizer,
+        "label",
+    )
+    unlabaled_dataloader = DataLoader(
+        unlabeled_dataset, sampler=SequentialSampler(unlabeled_dataset), batch_size=args.eval_batch_size
+    )
+    log_metrics({"label/unlabeled_examples": len(unlabeled_examples)})
+    eval_dataset, eval_examples, eval_features = load_and_cache_examples(
+        args,
+        tokenizer,
+        "eval",
+    )
+    eval_dataloader = DataLoader(
+        eval_dataset, sampler=SequentialSampler(eval_dataset), batch_size=args.eval_batch_size
+    )
+    log_metrics({"eval/examples": len(eval_examples)})
+
     # self-training
     for i in range(args.iterations):
         logger.debug(f"Self-training iteration {i + 1}")
@@ -490,7 +439,17 @@ def main():
             prev_labeled_set_path = os.path.join(args.output_dir, f"iter_{i - 1}.json")
         else:
             prev_labeled_set_path = None
-        acc_exact, acc_text = label(args, tokenizer, model, labeled_set_path, i + 1, prev_labeled_set_path)
+        acc_exact, acc_text = label(
+            args,
+            tokenizer,
+            model,
+            unlabaled_dataloader,
+            unlabeled_examples,
+            unlabeled_features,
+            i + 1,
+            labeled_set_path,
+            prev_labeled_set_path
+        )
         if not acc_exact:
             logger.debug("No pseudo-labels, abort self-training.")
             break
@@ -502,7 +461,23 @@ def main():
 
         logger.debug("Training...")
         model = BertForQuestionAnswering.from_pretrained(args.start_model).to(args.device)
-        global_step = train(args, tokenizer, model, labeled_set_path, i + 1, global_step)
+
+        train_dataset, train_examples, _ = load_and_cache_examples(
+            args,
+            tokenizer,
+            "train",
+            cache=False,
+            filepath=labeled_set_path,
+        )
+        train_dataloader = DataLoader(
+            train_dataset, sampler=RandomSampler(train_dataset), batch_size=args.train_batch_size
+        )
+        log_metrics({
+            "iteration": i + 1,
+            "train/examples": len(train_examples),
+        })
+
+        global_step = train(args, tokenizer, model, train_dataloader, global_step)
 
         ckpt_dir = os.path.join(args.output_dir, f"checkpoint_iter_{i + 1}")
         if not os.path.exists(ckpt_dir):
@@ -511,7 +486,8 @@ def main():
         model.save_pretrained(ckpt_dir)
 
         logger.debug("Evaluating...")
-        evaluate(args, tokenizer, model, i + 1)
+        evaluate(args, tokenizer, model, eval_dataloader, eval_examples, eval_features, i + 1)
+    remove_cache(args.output_dir)
 
 
 if __name__ == "__main__":
