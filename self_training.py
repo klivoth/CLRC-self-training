@@ -155,7 +155,10 @@ def logging_setup(args):
         wandb.login()
         wandb.init(project=args.project_name, config=wandb_config(args))
     global logger
-    logger = get_logger(logger, os.path.join(args.output_dir, args.exp_name + "_log.txt"))
+    logger = get_logger(
+        logger,
+        os.path.join(args.output_dir, args.exp_name + "_log.txt" if args.exp_name else "log.txt")
+    )
 
 
 def predict(args, dataloader, features, model, noise=0.0):
@@ -462,6 +465,8 @@ def main():
 
         logger.debug("Training...")
         model = BertForQuestionAnswering.from_pretrained(args.start_model).to(args.device)
+        if wandb_logging:
+            wandb.watch(model, log="all", log_freq=args.logging_steps)
 
         train_dataset, train_examples, _ = load_and_cache_examples(
             args,
