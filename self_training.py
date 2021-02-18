@@ -66,12 +66,6 @@ def parse_args():
     parser.add_argument(
         "--prob_threshold", default=None, type=float, required=True, help="Probability threshold for pseudo-labels."
     )
-    parser.add_argument(
-        "--noise", default=0.0, type=float, help="Level of noise added during predicting pseudo-labels."
-    )
-    parser.add_argument(
-        "--no_relabel", action="store_true", help="Not to update existing pseudo-labels every iteration."
-    )
 
     # wandb
     parser.add_argument("--use_wandb", action="store_true", help="Turn on wandb logging.")
@@ -131,7 +125,6 @@ def wandb_config(args):
         epochs=args.epochs,
         seed=args.seed,
         threshold=args.prob_threshold,
-        noise=args.noise,
     )
     if args.unlabeled_set:
         config["unlabeled_set"] = args.unlabeled_set
@@ -161,7 +154,7 @@ def logging_setup(args):
     )
 
 
-def predict(args, dataloader, features, model, noise=0.0):
+def predict(args, dataloader, features, model):
     all_results = []
     model.eval()
     for batch in tqdm(dataloader):
@@ -181,11 +174,6 @@ def predict(args, dataloader, features, model, noise=0.0):
             unique_id = int(feature.unique_id)
             output = [output[i] for output in outputs.to_tuple()]
             start_logits, end_logits = output
-            if noise > 0.0:
-                noise_tensor = torch.randn_like(start_logits)
-                start_logits = torch.lerp(start_logits, noise_tensor, noise)
-                noise_tensor = torch.randn_like(end_logits)
-                end_logits = torch.lerp(end_logits, noise_tensor, noise)
             result = SquadResult(unique_id, to_list(start_logits), to_list(end_logits))
             all_results.append(result)
     return all_results
@@ -281,8 +269,8 @@ def output_pseudo_labels(unlabeled_set, pseudo_labels, output):
     return acc_exact / total, acc_text / total
 
 
-def label(args, tokenizer, model, dataloader, examples, features, iteration, labeled_set_path, prev_labeled_set_path):
-    results = predict(args, dataloader, features, model, args.noise)
+def label(args, tokenizer, model, dataloader, examples, features, iteration, labeled_set_path):
+    results = predict(args, dataloader, features, model)
     predictions = compute_predictions(
         tokenizer,
         examples,
@@ -297,16 +285,6 @@ def label(args, tokenizer, model, dataloader, examples, features, iteration, lab
     pseudo_labels = filter_labels(examples, predictions, args.prob_threshold, args.lang)
     if len(pseudo_labels) == 0:
         return None, None
-    if prev_labeled_set_path:
-        logger.debug("Option no_relabel set")
-
-        with open(prev_labeled_set_path) as reader:
-            prev = json.load(reader)["data"]
-        for article in prev:
-            for par in article["paragraphs"]:
-                for qa in par["qas"]:
-                    qas_id = qa["id"]
-                    pseudo_labels[qas_id] = qa["answers"][0]
     log_metrics({
         "iteration": iteration,
         "label/labeled_examples": len(pseudo_labels),
@@ -439,10 +417,6 @@ def main():
 
         logger.debug("Labeling...")
         labeled_set_path = os.path.join(args.output_dir, f"iter_{i}.json")
-        if args.no_relabel and i > 0:
-            prev_labeled_set_path = os.path.join(args.output_dir, f"iter_{i - 1}.json")
-        else:
-            prev_labeled_set_path = None
         acc_exact, acc_text = label(
             args,
             tokenizer,
@@ -452,7 +426,6 @@ def main():
             unlabeled_features,
             i + 1,
             labeled_set_path,
-            prev_labeled_set_path
         )
         if not acc_exact:
             logger.debug("No pseudo-labels, abort self-training.")
