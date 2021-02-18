@@ -1,6 +1,8 @@
 import logging
 import os
+import random
 
+import numpy as np
 import torch
 
 from transformers import squad_convert_examples_to_features
@@ -96,3 +98,15 @@ def remove_cache(folder):
         cache = os.path.join(folder, f)
         if os.path.isfile(cache):
             os.remove(cache)
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+def to_list(tensor):
+    return tensor.detach().cpu().tolist()

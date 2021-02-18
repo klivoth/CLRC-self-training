@@ -6,9 +6,7 @@ Modified from the run_squad.py of huggingface's transformers repository:
 import argparse
 import logging
 import os
-import random
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from tqdm import tqdm
@@ -23,22 +21,17 @@ from transformers import (
 from transformers.data.processors.squad import SquadResult
 
 from metrics import compute_predictions, qa_evaluate
-from utils import dict_to_str, get_logger, load_and_cache_examples, remove_cache
+from utils import (
+    dict_to_str,
+    get_logger,
+    load_and_cache_examples,
+    remove_cache,
+    set_seed,
+    to_list,
+)
 
 logger = logging.getLogger(__name__)
 wandb_logging = False
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-
-
-def to_list(tensor):
-    return tensor.detach().cpu().tolist()
 
 
 def log_metrics(metrics_dict):
